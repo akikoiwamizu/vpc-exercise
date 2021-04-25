@@ -21,7 +21,15 @@ import requests
 import json
 import argparse
 import logging
+from flask import escape
+import pandas as pd
 import Database
+
+logging.debug('This is a debug message.')
+logging.info('This is an info message.')
+logging.warning('This is a warning message.')
+logging.error('This is an error message.')
+logging.critical('This is a critical message.')
 
 # Assume the following environment variables are correctly populated.
 # AWS_ACCESS_KEY_ID
@@ -68,6 +76,7 @@ BQ_SCHEMA = [
 #     disputed BOOLEAN
 # );
 
+# Need to convert field data types since API fields default to type string.
 def cast_columns(df, sch):
     BQ_POSTS = sch
     l = [i["name"] for i in BQ_POSTS]
@@ -109,20 +118,59 @@ def cfpb_api(url):
         Description of returned object.
 
     """
+    offset = 0
+    results = []
+    next_page = True
 
-    # TODO: Add exception handling here when the status code returned != 200
-    r = requests.get(url)
+    while next_page:
+        print(f'Page: ' + str(int(offset / 1000)) + '...')
 
-    # TODO: Add exception handling here if response is empty
-    response = r.json()
+        # Construct the CFPB's Open API GET Request.
+        data = {'no_aggs': 'true'
+                , 'sort': 'created_date_desc'
+                , 'frm': offset
+                , 'size': 1000}
 
-    # TODO: Add exception handling here if "hits" does not exist in repsonse
-    results = pd.json_normalize(response['hits'], sep = '_', max_level = 1)
+        # TODO: Add exception handling here when the status code returned != 200
+        r = requests.get(url=url, params=data)
 
-return results
+        # TODO: Add exception handling here if response is empty
+        response = r.json()
+
+        # Get the total number of complaints in the database.
+        total_complaints = int(response['hits']['total'])
+
+        # Get the total number of complaints in the response (max is 1000).
+        total_hits = response['hits']['hits']
+        print(f'{total_complaints} total complaints found!')
+        print(f'{int(offset) + int(len(total_hits))} extracted so far...')
+
+        # if (data['size'] + offset) < 50000:
+        if (data['size'] + offset) < total_complaints:
+            next_page = True
+        else:
+            next_page = False
+
+        offset += data['size']
+
+        for complaints in response['hits']['hits']:
+            df = pd.json_normalize(complaints['_source'])
+            results.append(df)
+            # if len(results) % 10000 == 0:
+            #     print(f'Processed {len(results)} complaints.')
+
+    results = pd.concat(results)
+    results.rename(columns={
+                'timely':'timely_response'
+                ,'zip_code':'zip'
+                ,'consumer_consent_provided':'consumer_consent'
+                ,'consumer_disputed':'disputed'}
+                , inplace=True)
+
+    return results
 
 
-def format_tbl(url, schema):
+def generate_table():
     """Short summary.
 
     Parameters
@@ -136,10 +184,11 @@ def format_tbl(url, schema):
         Description of returned object.
 
     """
-    response = cfpb_api(url)
-    response = cast_columns(response, schema)
+    base_url = 'https://www.consumerfinance.gov/data-research/consumer-complaints/search/api/v1/'
+    response = cfpb_api(base_url)
+    response = cast_columns(response, BQ_SCHEMA)
 
-return response
+    return response
 
 
 def main(request):
@@ -169,17 +218,12 @@ def main(request):
     BQ_TABLE = f"acronym-data-transfer.test.consumer_complaints"
     bq = bigquery.Client(project="acronym-data-transfer")
 
-    # Construct the CFPB's Open API GET Request.
-    api_url = 'https://www.consumerfinance.gov/data-research/consumer-complaints/search/api/v1/'
-
     # Extract data from API and format as a table to post to RedShift.
-    payload = format_tbl(url, BQ_SCHEMA)
+    payload = generate_table()
 
     BQ_CONFIG = []
     for i in BQ_SCHEMA:
         BQ_CONFIG.append(bigquery.SchemaField(i["name"], i["type"]))
-
-    print(f"Syncing to {BQ_TABLE}...")
 
     try:
         # write_disposition = 'WRITE_TRUNCATE': If the table already exists, BigQuery overwrites the table data and uses the schema from the load.
