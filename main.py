@@ -217,8 +217,8 @@ def access_api(url, start, end):
         except JSONDecodeError as e:
             logging.warning('No JSON response returned...')
 
-        # If HTTP response other than 200 or 540, then exit loop.
-        if r.status_code not in (200, 540):
+        # If HTTP response other than 200 or 504, then exit loop.
+        if r.status_code not in (200, 504):
             logging.error('Terminating loop - HTTP error cannot be resolved...')
             break
 
@@ -228,10 +228,10 @@ def access_api(url, start, end):
             break
 
         # Server timeouts occur frequently and at random. Try up to 10 times.
-        if r.status_code == 540 and reattempts <= 10:
+        if r.status_code == 504 and reattempts <= 10:
             logging.warning('Timeout error occurred...reattempt the request...')
             reattempts += 1
-        elif r.status_code == 540 and reattempts > 10:
+        elif r.status_code == 504 and reattempts > 10:
             logging.error('Reached the max reattempts allowed...exiting loop.')
             break
 
@@ -390,17 +390,16 @@ def main():
 
         # Extract data from API and format as a table to post to RedShift.
         print(f'Using this date range: {args.start} - {args.end}')
-        payload_api = generate_table(args.start, args.end)
-
-        # Write the pandas dataframe as a CSV to the S3 bucket.
-        write_df_to_csv(payload_api, TABLE_NAME)
+        payload = generate_table(args.start, args.end)
     else:
         # Download the entire complaints CSV file directly from the CFPB site.
-        payload_down = download_cfpb()
-        write_df_to_csv(payload_down, TABLE_NAME)
+        payload = download_cfpb()
+
+    # Write the pandas dataframe as a CSV to the S3 bucket.
+    write_df_to_csv(payload, TABLE_NAME)
 
     # Create empty Redshift table and copy data from S3 bucket into it.
-
+    
 
     print(f'Consumer Complaints Table Sync Complete!')
 
