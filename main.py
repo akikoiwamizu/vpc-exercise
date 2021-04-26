@@ -7,13 +7,13 @@ ___
 
 ## Script Information
 * Author: Akiko Iwamizu
-* Last Updated: 04/25/2021
+* Last Updated: 04/26/2021
 
 ## Steps:
 * Make a GET request to the CFPB Open API
 * Inspect JSON response and format table
-* Load the formatted table into S3 bucket
-* Import table from S3 into RedShift table
+* Upload the formatted table to S3 bucket
+* Import table from S3 into a RedShift table
 ___
 """
 import os
@@ -28,8 +28,10 @@ from zipfile import ZipFile
 from tempfile import NamedTemporaryFile
 
 # Assume the following environment variables are correctly populated.
-S3_BUCKET_NAME = 'xxxxxxxxxxx'
+AWS_ACCESS_KEY_ID = 'xxxxxxxxxxx'
+AWS_SECRET_ACCESS_KEY = 'xxxxxxxxxxx'
 TABLE_NAME = 'consumer_complaints'
+S3_BUCKET_NAME = 'xxxxxxxxxxx'
 
 # Set the fields extracted to column names and their equivalent data types.
 SCHEMA = [
@@ -49,8 +51,24 @@ SCHEMA = [
     {'name': 'disputed', 'type': 'BOOL'}
 ]
 
+
 # Need to convert field data types since API fields default to type string.
 def cast_columns(df, sch):
+    """Short summary.
+
+    Parameters
+    ----------
+    df : type
+        Description of parameter `df`.
+    sch : type
+        Description of parameter `sch`.
+
+    Returns
+    -------
+    type
+        Description of returned object.
+
+    """
     schema = sch
     l = [i['name'] for i in schema]
     temp = l
@@ -82,17 +100,29 @@ def cast_columns(df, sch):
 
 
 def is_downloadable(url):
-    """
-    Check for if the url passed contains a downloadable item.
+    """Short summary.
+
+    Parameters
+    ----------
+    url : type
+        Description of parameter `url`.
+
+    Returns
+    -------
+    type
+        Description of returned object.
 
     """
     h = requests.head(url, allow_redirects=True)
     header = h.headers
     content_type = header.get('content-type')
+
     if 'text' in content_type.lower():
         return False
+
     if 'html' in content_type.lower():
         return False
+
     return True
 
 
@@ -109,17 +139,17 @@ def download_cfpb():
     results = pd.DataFrame()
 
     # Check if the file is downloadable before making any calls.
-    print(f'Can this file be downloaded? {is_downloadable(download_url)}')
+    logging.info(f'Can this file be downloaded? {is_downloadable(download_url)}')
 
     if is_downloadable(download_url) is True:
-        # TODO: Add error handling here if the file was not found.
         try:
             r = requests.get(download_url, allow_redirects=True)
             open('complaints.csv.zip', 'wb').write(r.content)
             zf = ZipFile('complaints.csv.zip')
             df = pd.read_csv(zf.open('complaints.csv'))
-            print(f'Downloaded {len(df)} rows from CSV...')
-            print(f'Columns found in CSV: {list(df.columns)}')
+            logging.info(f'Downloading {len(df)} rows from CSV...')
+            logging.info(f'Columns found in CSV: {list(df.columns)}')
+
             # Rename columns before casting data types.
             df.columns = df.columns.str.lower()
             df.columns = df.columns.str.replace(' ','_')
@@ -131,8 +161,14 @@ def download_cfpb():
                         ,'consumer_consent_provided':'consumer_consent'
                         ,'consumer_disputed':'disputed'}
                         , inplace=True)
-            print(f'Final columns after cleaning: {list(df.columns)}')
+
+            logging.info(f'Final columns after cleaning: {list(df.columns)}')
             results = cast_columns(df, SCHEMA)
+
+            # Delete file in directory after successful df creation.
+            zf.close()
+            os.remove('complaints.csv.zip')
+            logging.info('Deleting original zip file from directory...')
         except Exception as e:
             logging.error(f'There was an issue with the file: {e}')
 
@@ -149,13 +185,14 @@ def access_api(url, start, end):
 
     """
     offset = 0
+    reattempts = 0
     results = []
     next_page = True
 
     while next_page:
         logging.info(f'Page: ' + str(int(offset / 1000)) + '...')
 
-        # Construct the CFPB's Open API GET Request.
+        # Parameters to pass in the CFPB's Open API GET Request.
         data = {'no_aggs': 'true'
                 , 'sort': 'created_date_desc'
                 , 'frm': offset
@@ -180,14 +217,29 @@ def access_api(url, start, end):
         except JSONDecodeError as e:
             logging.warning('No JSON response returned...')
 
-        if response is None or r.status_code != 200:
-            logging.warning('Exit paging loop since JSON response is empty...')
+        # If HTTP response other than 200 or 540, then exit loop.
+        if r.status_code not in (200, 540):
+            logging.error('Terminating loop - HTTP error cannot be resolved...')
+            break
+
+        # If no complaints were found or returned, then exit loop.
+        if response is None or response['hits']['total'] == 0:
+            logging.error('Exit paging loop since no complaints were found...')
+            break
+
+        # Server timeouts occur frequently and at random. Try up to 10 times.
+        if r.status_code == 540 and reattempts <= 10:
+            logging.warning('Timeout error occurred...reattempt the request...')
+            reattempts += 1
+        elif r.status_code == 540 and reattempts > 10:
+            logging.error('Reached the max reattempts allowed...exiting loop.')
             break
 
         try:
             # Get the total number of complaints in the database.
             total_complaints = int(response['hits']['total'])
             logging.info(f'{total_complaints} total complaints found!')
+            logging.info(f'{abs(total_complaints - offset)} complaints left!')
 
             # Get the total number of complaints in the response (max is 1000).
             total_hits = response['hits']['hits']
@@ -198,23 +250,26 @@ def access_api(url, start, end):
             else:
                 next_page = False
 
-            offset += data['size']
+            # If the API request was successful, increment the offset.
+            if r.status_code == 200:
+                offset += data['size']
 
             for complaints in response['hits']['hits']:
                 df = pd.json_normalize(complaints['_source'])
                 results.append(df)
-                # if len(results) % 1000 == 0:
-                #     print(f'Processed {len(results)} complaints.')
         except(IndexError, KeyError, TypeError):
             logging.error('JSON response was not structured as expected...')
 
-    results = pd.concat(results)
-    results.rename(columns={
+    try:
+        results = pd.concat(results)
+        results.rename(columns={
                 'timely':'timely_response'
                 ,'zip_code':'zip'
                 ,'consumer_consent_provided':'consumer_consent'
                 ,'consumer_disputed':'disputed'}
                 , inplace=True)
+    except Exception as e:
+        logging.error(f'There was an issue saving the results to a df: {e}')
 
     return results
 
@@ -230,7 +285,12 @@ def generate_table(start, end):
     """
     api_url = 'https://www.consumerfinance.gov/data-research/consumer-complaints/search/api/v1/'
     response = access_api(api_url, start, end)
-    results = cast_columns(response, SCHEMA)
+    results = pd.DataFrame()
+
+    try:
+        results = cast_columns(response, SCHEMA)
+    except Exception as e:
+        logging.error(f'There was an issue casting the df columns: {e}')
 
     return results
 
@@ -255,7 +315,7 @@ def write_df_to_csv(df, name):
 
     logging.info(f'Writing {len(df)} records to {output_file_name}')
 
-    # Write dataframe as CSV to temp file. Implement chunk size if too big.
+    # Write dataframe as CSV and compress to ZIP temp file.
     df.to_csv(output_file, index=False)
     output_file.flush()
     zipfile = ZipFile(results_file_path, 'w')
@@ -265,8 +325,10 @@ def write_df_to_csv(df, name):
     # Upload CSV file to S3 bucket.
     d = Database()
     d.upload_file_to_s3(results_file_path, S3_BUCKET_NAME, f'{name}.zip')
+    logging.info(f'Uploading {output_file_name} to S3 bucket...')
 
-    # TODO: Add logic to delete file in directory after successful upload to S3.
+    # TODO: Check for successful upload validation from S3 before deleting.
+    # os.remove(results_file_path)
 
     return None
 
@@ -291,20 +353,6 @@ def load_csv_to_redshift():
     return None
 
 
-def get_dates(sta, sto):
-    start = datetime.strptime(sta, "%Y-%m-%d")
-    end = datetime.strptime(sto, "%Y-%m-%d")
-
-    date_generated = [start + timedelta(days=x) for x in range(0, (end - start).days)]
-
-    result = []
-
-    for date in date_generated:
-        result.append(date.strftime("%Y-%m-%d"))
-
-    return result
-
-
 def main():
     logging.basicConfig(level=0)
     parser = argparse.ArgumentParser()
@@ -317,23 +365,39 @@ def main():
     args = parser.parse_args()
 
     if args.method == 'api':
-        if args.start is None and args.end is None:
+        if args.start is None or args.end is None:
             print('If using the API, then a date range should be passed.')
             today = datetime.now().strftime('%Y-%m-%d')
-            args.start = (datetime.strptime(today, '%Y-%m-%d') - timedelta(days=3)).strftime('%Y-%m-%d')
-            args.end = (datetime.strptime(today, '%Y-%m-%d') - timedelta(days=2)).strftime('%Y-%m-%d')
+            if args.start is None:
+                args.start = (datetime.strptime(today, '%Y-%m-%d')
+                                - timedelta(days=3)).strftime('%Y-%m-%d')
+            if args.end is None:
+                args.end = (datetime.strptime(today, '%Y-%m-%d')
+                                - timedelta(days=2)).strftime('%Y-%m-%d')
 
-        # TODO: Check that date range is valid...CFPB has a two day lag time!
+        # Checking that date range is valid...FYI CFPB has a 3 day lag time!
+        if args.start >= args.end:
+            logging.error(f'Date range {args.start} - {args.end} is invalid...')
+            logging.error('Please try again!')
+            sys.exit()
+
+        # Print a warning if the date range passed is more than 3 months.
+        date_diff = abs((datetime.strptime(args.end, '%Y-%m-%d')
+                    - datetime.strptime(args.start, '%Y-%m-%d')).days)
+        if date_diff >= 90: # About 3 months
+            logging.warning(f'Trying to pull {date_diff} days of data...')
+            logging.warning(f'Server timeout might occur, so watch logs...')
 
         # Extract data from API and format as a table to post to RedShift.
         print(f'Using this date range: {args.start} - {args.end}')
-        payload = generate_table(args.start, args.end)
+        payload_api = generate_table(args.start, args.end)
 
         # Write the pandas dataframe as a CSV to the S3 bucket.
         write_df_to_csv(payload_api, TABLE_NAME)
     else:
         # Download the entire complaints CSV file directly from the CFPB site.
         payload_down = download_cfpb()
+        write_df_to_csv(payload_down, TABLE_NAME)
 
     # Create empty Redshift table and copy data from S3 bucket into it.
 
