@@ -16,100 +16,130 @@ ___
 * Import table from S3 into RedShift table
 ___
 """
-
+import os
 import requests
-import json
-import argparse
 import logging
-from flask import escape
 import pandas as pd
-import Database
-
-logging.debug('This is a debug message.')
-logging.info('This is an info message.')
-logging.warning('This is a warning message.')
-logging.error('This is an error message.')
-logging.critical('This is a critical message.')
+from json.decoder import JSONDecodeError
+from datetime import datetime, timedelta
+import argparse
+from Database import *
+from zipfile import ZipFile
+from tempfile import NamedTemporaryFile
 
 # Assume the following environment variables are correctly populated.
-# AWS_ACCESS_KEY_ID
-# AWS_SECRET_ACCESS_KEY
-# TABLE_NAME
-# S3_BUCKET_NAME
+S3_BUCKET_NAME = 'xxxxxxxxxxx'
+TABLE_NAME = 'consumer_complaints'
 
 # Set the fields extracted to column names and their equivalent data types.
-BQ_SCHEMA = [
-    {"name": "complaint_id", "type": bigquery.enums.SqlTypeNames.INT64},
-    {"name": "date_received", "type": bigquery.enums.SqlTypeNames.DATE},
-    {"name": "product", "type": bigquery.enums.SqlTypeNames.STRING},
-    {"name": "sub_product", "type": bigquery.enums.SqlTypeNames.STRING},
-    {"name": "issue", "type": bigquery.enums.SqlTypeNames.STRING},
-    {"name": "sub_issue", "type": bigquery.enums.SqlTypeNames.STRING},
-    {"name": "company", "type": bigquery.enums.SqlTypeNames.STRING},
-    {"name": "state", "type": bigquery.enums.SqlTypeNames.STRING},
-    {"name": "zip", "type": bigquery.enums.SqlTypeNames.STRING},
-    {"name": "consumer_consent", "type": bigquery.enums.SqlTypeNames.BOOL},
-    {"name": "date_sent_to_company", "type": bigquery.enums.SqlTypeNames.DATE},
-    {"name": "company_response", "type": bigquery.enums.SqlTypeNames.STRING},
-    {"name": "timely_response", "type": bigquery.enums.SqlTypeNames.BOOL},
-    {"name": "disputed", "type": bigquery.enums.SqlTypeNames.BOOL}
+SCHEMA = [
+    {'name': 'complaint_id', 'type': 'INT64'},
+    {'name': 'date_received', 'type': 'DATE'},
+    {'name': 'product', 'type': 'STRING'},
+    {'name': 'sub_product', 'type': 'STRING'},
+    {'name': 'issue', 'type': 'STRING'},
+    {'name': 'sub_issue', 'type': 'STRING'},
+    {'name': 'company', 'type': 'STRING'},
+    {'name': 'state', 'type': 'STRING'},
+    {'name': 'zip', 'type': 'STRING'},
+    {'name': 'consumer_consent', 'type': 'BOOL'},
+    {'name': 'date_sent_to_company', 'type': 'DATE'},
+    {'name': 'company_response', 'type': 'STRING'},
+    {'name': 'timely_response', 'type': 'BOOL'},
+    {'name': 'disputed', 'type': 'BOOL'}
 ]
 
 # Need to convert field data types since API fields default to type string.
-
-
-# The RedShift table name, schema, and desired fields with their data types.
-# CREATE TABLE cfpb.consumer_complaints (
-#     complaint_id BIGINT DISTKEY,
-#     date_received DATE,
-#     product VARCHAR(256),
-#     sub_product VARCHAR(256),
-#     issue VARCHAR(256),
-#     sub_issue VARCHAR(256),
-#     company VARCHAR(256),
-#     state VARCHAR(2),
-#     zip VARCHAR(5),
-#     consumer_consent BOOLEAN,
-#     date_sent_to_company DATE,
-#     company_response VARCHAR(256),
-#     timely_response BOOLEAN,
-#     disputed BOOLEAN
-# );
-
-# Need to convert field data types since API fields default to type string.
 def cast_columns(df, sch):
-    BQ_POSTS = sch
-    l = [i["name"] for i in BQ_POSTS]
-
+    schema = sch
+    l = [i['name'] for i in schema]
     temp = l
     df = df[temp]
 
     for c in df.columns:
         j = temp.index(c)
-        col = BQ_POSTS[j]["type"]
+        col_type = schema[j]['type']
         pd.set_option('mode.chained_assignment', None)
 
-        if col == bigquery.enums.SqlTypeNames.INT64:
+        if col_type == 'INT64':
             df[c] = df[c].fillna(0)
             df[c] = pd.to_numeric(df[c], downcast='integer')
             df[c] = df[c].astype('int64')
 
-        if col == bigquery.enums.SqlTypeNames.FLOAT64:
+        if col_type == 'FLOAT64':
             df[c] = df[c].astype('float64')
 
-        if col == bigquery.enums.SqlTypeNames.STRING:
+        if col_type == 'STRING':
             df[c] = df[c].astype('str')
 
-        if col == bigquery.enums.SqlTypeNames.BOOL:
+        if col_type == 'BOOL':
             df[c] = df[c].astype('bool')
 
-        if col == bigquery.enums.SqlTypeNames.DATE:
+        if col_type == 'DATE':
             df[c] = pd.to_datetime(df[c]).dt.date
 
     return df
 
 
-def cfpb_api(url):
+def is_downloadable(url):
+    """
+    Check for if the url passed contains a downloadable item.
+
+    """
+    h = requests.head(url, allow_redirects=True)
+    header = h.headers
+    content_type = header.get('content-type')
+    if 'text' in content_type.lower():
+        return False
+    if 'html' in content_type.lower():
+        return False
+    return True
+
+
+def download_cfpb():
+    """Short summary.
+
+    Returns
+    -------
+    type
+        Description of returned object.
+
+    """
+    download_url = 'https://files.consumerfinance.gov/ccdb/complaints.csv.zip'
+    results = pd.DataFrame()
+
+    # Check if the file is downloadable before making any calls.
+    print(f'Can this file be downloaded? {is_downloadable(download_url)}')
+
+    if is_downloadable(download_url) is True:
+        # TODO: Add error handling here if the file was not found.
+        try:
+            r = requests.get(download_url, allow_redirects=True)
+            open('complaints.csv.zip', 'wb').write(r.content)
+            zf = ZipFile('complaints.csv.zip')
+            df = pd.read_csv(zf.open('complaints.csv'))
+            print(f'Downloaded {len(df)} rows from CSV...')
+            print(f'Columns found in CSV: {list(df.columns)}')
+            # Rename columns before casting data types.
+            df.columns = df.columns.str.lower()
+            df.columns = df.columns.str.replace(' ','_')
+            df.columns = df.columns.str.replace('?','')
+            df.columns = df.columns.str.replace('-','_')
+            df.rename(columns={
+                        'company_response_to_consumer':'company_response'
+                        ,'zip_code':'zip'
+                        ,'consumer_consent_provided':'consumer_consent'
+                        ,'consumer_disputed':'disputed'}
+                        , inplace=True)
+            print(f'Final columns after cleaning: {list(df.columns)}')
+            results = cast_columns(df, SCHEMA)
+        except Exception as e:
+            logging.error(f'There was an issue with the file: {e}')
+
+    return results
+
+
+def access_api(url, start, end):
     """Short summary.
 
     Returns
@@ -123,41 +153,60 @@ def cfpb_api(url):
     next_page = True
 
     while next_page:
-        print(f'Page: ' + str(int(offset / 1000)) + '...')
+        logging.info(f'Page: ' + str(int(offset / 1000)) + '...')
 
         # Construct the CFPB's Open API GET Request.
         data = {'no_aggs': 'true'
                 , 'sort': 'created_date_desc'
                 , 'frm': offset
-                , 'size': 1000}
+                , 'size': 1000
+                , 'date_received_min': start
+                , 'date_received_max': end}
 
-        # TODO: Add exception handling here when the status code returned != 200
-        r = requests.get(url=url, params=data)
+        try:
+            r = requests.get(url=url, params=data)
+            r.raise_for_status()
+        except requests.exceptions.HTTPError as eh:
+            print('HTTP Error:', eh)
+        except requests.exceptions.ConnectionError as ec:
+            print('Error Connecting:', ec)
+        except requests.exceptions.Timeout as et:
+            print('Timeout Error:', et)
+        except requests.exceptions.RequestException as er:
+            print('Another Error:', er)
 
-        # TODO: Add exception handling here if response is empty
-        response = r.json()
+        try:
+            response = r.json()
+        except JSONDecodeError as e:
+            logging.warning('No JSON response returned...')
 
-        # Get the total number of complaints in the database.
-        total_complaints = int(response['hits']['total'])
+        if response is None or r.status_code != 200:
+            logging.warning('Exit paging loop since JSON response is empty...')
+            break
 
-        # Get the total number of complaints in the response (max is 1000).
-        total_hits = response['hits']['hits']
-        print(f'{total_complaints} total complaints found!')
-        print(f'{int(offset) + int(len(total_hits))} extracted so far...')
+        try:
+            # Get the total number of complaints in the database.
+            total_complaints = int(response['hits']['total'])
+            logging.info(f'{total_complaints} total complaints found!')
 
-        # if (data['size'] + offset) < 50000:
-        if (data['size'] + offset) < total_complaints:
-            next_page = True
-        else:
-            next_page = False
+            # Get the total number of complaints in the response (max is 1000).
+            total_hits = response['hits']['hits']
+            logging.info(f'{int(offset) + int(len(total_hits))} extracted so far...')
 
-        offset += data['size']
+            if (data['size'] + offset) < total_complaints:
+                next_page = True
+            else:
+                next_page = False
 
-        for complaints in response['hits']['hits']:
-            df = pd.json_normalize(complaints['_source'])
-            results.append(df)
-            # if len(results) % 10000 == 0:
-            #     print(f'Processed {len(results)} complaints.')
+            offset += data['size']
+
+            for complaints in response['hits']['hits']:
+                df = pd.json_normalize(complaints['_source'])
+                results.append(df)
+                # if len(results) % 1000 == 0:
+                #     print(f'Processed {len(results)} complaints.')
+        except(IndexError, KeyError, TypeError):
+            logging.error('JSON response was not structured as expected...')
 
     results = pd.concat(results)
     results.rename(columns={
@@ -170,73 +219,126 @@ def cfpb_api(url):
     return results
 
 
-def generate_table():
-    """Short summary.
-
-    Parameters
-    ----------
-    df : type
-        Description of parameter `df`.
+def generate_table(start, end):
+    """Calls the CFPB Open API, creates a df, and casts column data types.
 
     Returns
     -------
-    type
-        Description of returned object.
+    dataframe
+        Returns the final dataframe containing all consumer complaints.
 
     """
-    base_url = 'https://www.consumerfinance.gov/data-research/consumer-complaints/search/api/v1/'
-    response = cfpb_api(base_url)
-    response = cast_columns(response, BQ_SCHEMA)
+    api_url = 'https://www.consumerfinance.gov/data-research/consumer-complaints/search/api/v1/'
+    response = access_api(api_url, start, end)
+    results = cast_columns(response, SCHEMA)
 
-    return response
+    return results
 
 
-def main(request):
-    """Short summary.
+def write_df_to_csv(df, name):
+    """Write pandas dataframe as a csv and upload to S3.
 
     Parameters
     ----------
-    request : type
-        Description of parameter `request`.
-
-    Returns
-    -------
-    type
-        Description of returned object.
+    df : DataFrame
+        A pandas dataframe containing all consumer complaints.
+    name : String
+        A string representing the name of the csv file to be uploaded to S3.
 
     """
-    try:
-        print(f'Passing arguments for GCF...')
-        arguments = request.get_json(force=True)
-        start = escape(arguments['start']) if 'start' in arguments else None # Optional
-        end = escape(arguments['end']) if 'end' in arguments else None # Optional
-        write_type = escape(arguments['write_type']) if 'write_type' in arguments else None # Optional
-    except (KeyError, NameError, TypeError, RuntimeError, ValueError) as e:
-        print(f'WARNING: Handling error - {e}')
+    if not os.path.exists('results'):
+        os.mkdir('results')
+    results_file_path = f'results/{name}.zip'
 
-    # DELETE: Set & Update BigQuery Table
-    BQ_TABLE = f"acronym-data-transfer.test.consumer_complaints"
-    bq = bigquery.Client(project="acronym-data-transfer")
+    output_file_name = f'{name}.csv'
+    output_file = NamedTemporaryFile(mode='wt')
 
-    # Extract data from API and format as a table to post to RedShift.
-    payload = generate_table()
+    logging.info(f'Writing {len(df)} records to {output_file_name}')
 
-    BQ_CONFIG = []
-    for i in BQ_SCHEMA:
-        BQ_CONFIG.append(bigquery.SchemaField(i["name"], i["type"]))
+    # Write dataframe as CSV to temp file. Implement chunk size if too big.
+    df.to_csv(output_file, index=False)
+    output_file.flush()
+    zipfile = ZipFile(results_file_path, 'w')
+    zipfile.write(output_file.name, output_file_name)
+    zipfile.close()
 
-    try:
-        # write_disposition = 'WRITE_TRUNCATE': If the table already exists, BigQuery overwrites the table data and uses the schema from the load.
-        # DEFAULT: If the table already exists, BigQuery appends the table data and uses the schema from the load.
-        if write_type == "TRUNCATE":
-            job = bq.load_table_from_dataframe(payload, BQ_TABLE, job_config=bigquery.LoadJobConfig(schema=BQ_CONFIG, write_disposition='WRITE_TRUNCATE'))
-        else:
-            job = bq.load_table_from_dataframe(payload, BQ_TABLE, job_config=bigquery.LoadJobConfig(schema=BQ_CONFIG))
-        print(job.result())
-    except (KeyError, NameError, TypeError, ValueError, RuntimeError) as e:
-        print(f'WARNING: Handling error - {e}')
+    # Upload CSV file to S3 bucket.
+    d = Database()
+    d.upload_file_to_s3(results_file_path, S3_BUCKET_NAME, f'{name}.zip')
 
-    print(f"Consumer Complaints Table Sync Complete!")
+    # TODO: Add logic to delete file in directory after successful upload to S3.
+
+    return None
+
+def load_csv_to_redshift():
+    # The RedShift table name, schema, and desired fields with their data types.
+    sql_query = """CREATE TABLE cfpb.consumer_complaints(
+        complaint_id BIGINT DISTKEY,
+        date_received DATE,
+        product VARCHAR(256),
+        sub_product VARCHAR(256),
+        issue VARCHAR(256),
+        sub_issue VARCHAR(256),
+        company VARCHAR(256),
+        state VARCHAR(2),
+        zip VARCHAR(5),
+        consumer_consent BOOLEAN,
+        date_sent_to_company DATE,
+        company_response VARCHAR(256),
+        timely_response BOOLEAN,
+        disputed BOOLEAN);"""
+
+    return None
+
+
+def get_dates(sta, sto):
+    start = datetime.strptime(sta, "%Y-%m-%d")
+    end = datetime.strptime(sto, "%Y-%m-%d")
+
+    date_generated = [start + timedelta(days=x) for x in range(0, (end - start).days)]
+
+    result = []
+
+    for date in date_generated:
+        result.append(date.strftime("%Y-%m-%d"))
+
+    return result
+
+
+def main():
+    logging.basicConfig(level=0)
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--start'
+        , help='returns complaints with start >= date_received_min (format: YYYY-MM-DD)')
+    parser.add_argument('--end'
+        , help='returns complaints with end < date_received_max (format: YYYY-MM-DD)')
+    parser.add_argument('--method', default='download'
+        , help='a method to get data from the CFPB (options: download or api)')
+    args = parser.parse_args()
+
+    if args.method == 'api':
+        if args.start is None and args.end is None:
+            print('If using the API, then a date range should be passed.')
+            today = datetime.now().strftime('%Y-%m-%d')
+            args.start = (datetime.strptime(today, '%Y-%m-%d') - timedelta(days=3)).strftime('%Y-%m-%d')
+            args.end = (datetime.strptime(today, '%Y-%m-%d') - timedelta(days=2)).strftime('%Y-%m-%d')
+
+        # TODO: Check that date range is valid...CFPB has a two day lag time!
+
+        # Extract data from API and format as a table to post to RedShift.
+        print(f'Using this date range: {args.start} - {args.end}')
+        payload = generate_table(args.start, args.end)
+
+        # Write the pandas dataframe as a CSV to the S3 bucket.
+        write_df_to_csv(payload_api, TABLE_NAME)
+    else:
+        # Download the entire complaints CSV file directly from the CFPB site.
+        payload_down = download_cfpb()
+
+    # Create empty Redshift table and copy data from S3 bucket into it.
+
+
+    print(f'Consumer Complaints Table Sync Complete!')
 
 
 if __name__ == '__main__':
