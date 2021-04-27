@@ -23,9 +23,11 @@ import logging
 import pandas as pd
 from json.decoder import JSONDecodeError
 from datetime import datetime, timedelta
+from time import sleep
 import argparse
-from Database import *
 from zipfile import ZipFile
+from Database import *
+
 
 # Assume the following environment variables are correctly populated.
 AWS_ACCESS_KEY_ID = 'xxxxxxxxxxx'
@@ -57,10 +59,10 @@ def cast_columns(df, sch):
 
     Parameters
     ----------
-    df : type
-        Description of parameter `df`.
-    sch : type
-        Description of parameter `sch`.
+    df : dataframe
+        The dataframe whose columns need to be cast into different data types.
+    sch : list of dictionaries
+        The schema of columns and their respective data types to cast.
 
     Returns
     -------
@@ -99,17 +101,16 @@ def cast_columns(df, sch):
 
 
 def is_downloadable(url):
-    """Short summary.
+    """Used to check if a downloadable object exists in its content header.
 
     Parameters
     ----------
-    url : type
-        Description of parameter `url`.
+    url : string
 
     Returns
     -------
     boolean
-        A true/false is returned if the url link has a downloadable object.
+        True/False is returned if the url link has a downloadable object.
 
     """
     h = requests.head(url, allow_redirects=True)
@@ -127,7 +128,7 @@ def is_downloadable(url):
 
 def download_cfpb():
     """CFPB Open API calls for large amounts of data are unreliable. Instead,
-    download the complaint data file directly from the site if desired.
+    download the complaint data file directly from the site and convert to df.
 
     Returns
     -------
@@ -187,7 +188,7 @@ def access_api(url, start, end):
     next_page = True
 
     while next_page:
-        logging.info(f'Page: {str(int(offset / 1000))} .')
+        logging.info(f'Page: {str(int(offset / 1000))}')
 
         # Parameters to pass in the CFPB's Open API GET Request.
         data = {'no_aggs': 'true', 'sort': 'created_date_desc', 'frm': offset,
@@ -212,7 +213,7 @@ def access_api(url, start, end):
 
         # If HTTP response other than 200 or 504, then exit loop.
         if r.status_code not in (200, 504):
-            logging.error('Terminating loop - HTTP error cannot be resolved.')
+            logging.error('Terminating loop... HTTP error cannot be resolved.')
             break
 
         # If no complaints were found or returned, then exit loop.
@@ -222,37 +223,39 @@ def access_api(url, start, end):
 
         # Server timeouts occur frequently and at random. Try up to 10 times.
         if r.status_code == 504 and reattempts <= 10:
-            logging.warning('Timeout error occurred.reattempt the request.')
+            logging.warning('Timeout error occurred. Reattempting the request.')
+            logging.warning(f'Reattempts remaining: {10 - reattempts}')
             reattempts += 1
+            sleep(5)  # Wait ten seconds before reattempting the API request.
         elif r.status_code == 504 and reattempts > 10:
-            logging.error('Reached the max reattempts allowed.exiting loop.')
+            logging.error('Reached the max reattempts allowed. Exiting loop.')
             break
 
-        try:
-            # Get the total number of complaints in the database.
-            total_complaints = int(response['hits']['total'])
-            logging.info(f'{total_complaints} total complaints found!')
-            logging.info(f'{abs(total_complaints - offset)} complaints left!')
+        # If the API request was successful, continue data extraction.
+        if r.status_code == 200:
+            try:
+                # Get the total number of complaints in the database.
+                total_complaints = int(response['hits']['total'])
+                logging.info(f'{total_complaints} total complaints found!')
+                logging.info(f'{abs(total_complaints - offset)} complaints left!')
 
-            # Get the total number of complaints in the response (max is 1000).
-            total_hits = response['hits']['hits']
-            logging.info(
-                f'{int(offset) + int(len(total_hits))} extracted so far.')
+                # Get the total number of complaints in the response (max is 1000).
+                total_hits = response['hits']['hits']
+                logging.info(
+                    f'{int(offset) + int(len(total_hits))} extracted so far.')
 
-            if (data['size'] + offset) < total_complaints:
-                next_page = True
-            else:
-                next_page = False
+                if (data['size'] + offset) < total_complaints:
+                    next_page = True
+                else:
+                    next_page = False
 
-            # If the API request was successful, increment the offset.
-            if r.status_code == 200:
                 offset += data['size']
 
-            for complaints in response['hits']['hits']:
-                df = pd.json_normalize(complaints['_source'])
-                results.append(df)
-        except(IndexError, KeyError, TypeError):
-            logging.error('JSON response was not structured as expected.')
+                for complaints in response['hits']['hits']:
+                    df = pd.json_normalize(complaints['_source'])
+                    results.append(df)
+            except(IndexError, KeyError, TypeError):
+                logging.error('JSON response was not structured as expected.')
 
     try:
         results = pd.concat(results)
@@ -341,15 +344,15 @@ def load_csv_to_redshift():
     d.run_sql(table_query)
     logging.info(f'Created {TABLE_NAME} table in Redshift.')
 
-    # Fastest method for CSV to Redshift is using "copy" method.
+    # Fastest method for appending CSV data to Redshift is using "copy".
     # TODO: Add error handling to check if file exists in S3 bucket.
     copy_query = """COPY cfpb.consumer_complaints
         FROM 's3://S3_BUCKET_NAME/consumer_complaints.csv'
         CREDENTIALS 'aws_access_key_id=YOUR_ACCESS_KEY;
         aws_secret_access_key=YOUR_SECRET_ACCESS_KEY'
-        CSV IGNOREHEADER 1 TRIMBLANKS BLANKSASNULL NULL 'NaN' ACCEPTINVCHARS;"""
+        CSV IGNOREHEADER 1 TRIMBLANKS BLANKSASNULL NULL 'nan' ACCEPTINVCHARS;"""
 
-    # Use dummy object to copy table from S3 to Redshift.
+    # Use dummy object to copy data from S3 to Redshift table.
     # TODO: Add error handling to check if sql call was successful or not.
     d.run_sql(copy_query)
     logging.info(f'Copied {TABLE_NAME}.csv from S3 to Redshift.')
@@ -376,15 +379,15 @@ def main():
             today = datetime.now().strftime('%Y-%m-%d')
             if args.start is None:
                 args.start = (datetime.strptime(today, '%Y-%m-%d')
-                              - timedelta(days=3)).strftime('%Y-%m-%d')
+                              - timedelta(days=2)).strftime('%Y-%m-%d')
             if args.end is None:
                 args.end = (datetime.strptime(today, '%Y-%m-%d')
-                            - timedelta(days=2)).strftime('%Y-%m-%d')
+                            - timedelta(days=1)).strftime('%Y-%m-%d')
 
-        # Checking that date range is valid.FYI CFPB has a 3 day lag time!
+        # Checking that date range is valid. FYI CFPB has a 1-2 day lag time!
         if args.start >= args.end:
             logging.error(f'Date range {args.start} - {args.end} is invalid.')
-            logging.error('Please try again!')
+            logging.error('There is usually a 1-2 day lag. Try using new dates!')
             sys.exit()
 
         # Print a warning if the date range passed is more than 3 months.
@@ -404,8 +407,7 @@ def main():
     # Write the pandas dataframe as a CSV to the S3 bucket.
     write_df_to_csv(payload, TABLE_NAME)
 
-    # Create empty Redshift table and copy data from S3 bucket into it.
-    # TODO: create args for deciding overwrite or append options for Redshift.
+    # Create Redshift table (if needed) and copy data from S3 bucket into it.
     load_csv_to_redshift()
 
     print('Consumer Complaints Table Sync Complete!')
